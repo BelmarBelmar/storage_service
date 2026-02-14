@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+logs/nginx/*.log
+!logs/nginx/.gitkeep
+nginx/certs/*
+!nginx/certs/.gitkeep
+.vscode/
+.idea/

@@ -242,6 +242,7 @@ md5sum test-image.jpg downloaded_image.jpg
 5. Script de test complet
 
 Un script de test complet (`test_api.sh`) est disponible dans le répertoire dans le but d'automatiser les tests avec les fichiers.
+Pour l'utiliser, remplacer toutes les occurences de l'adresse IP 192.168.122.91 par l'adresse IP de votre VM.
 
 ```bash
 chmod +x test_api.sh

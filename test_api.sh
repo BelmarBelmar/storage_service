@@ -15,6 +15,8 @@ curl -s -X POST http://localhost:8000/auth/request-otp \
   -d '{"email": "test@example.com"}'
 
 
+echo ""
+
 # Attendre un peu et récupérer l'OTP des logs
 echo -e "\n${GREEN}2. Récupération de l'OTP depuis les logs...${NC}"
 sleep 2
@@ -72,13 +74,12 @@ curl -s -X GET http://localhost:8000/files/ \
 # Obtenir une URL de téléchargement
 FILENAME=$(basename $FILE)
 echo -e "\n${GREEN}6. Génération URL de téléchargement pour $FILENAME...${NC}"
-curl -s -X GET "http://localhost:8000/files/download/$FILENAME" \
-  -H "Authorization: Bearer $TOKEN" | jq .
+DOWNLOAD_RESPONSE=$(curl -s -X GET "http://localhost:8000/files/download/$FILENAME" \
+  -H "Authorization: Bearer $TOKEN")
 
-echo "Réponse: $RESPONSE"
 
 # Extraire l'URL et la convertir
-INTERNAL_URL=$(echo $RESPONSE | jq -r .url)
+INTERNAL_URL=$(echo $DOWNLOAD_RESPONSE | jq -r .url)
 if [ "$INTERNAL_URL" != "null" ] && [ ! -z "$INTERNAL_URL" ]; then
     # Remplacer minio:9000 par l'IP publique
     PUBLIC_URL=$(echo $INTERNAL_URL | sed 's/minio:9000/192.168.122.91/')
@@ -87,15 +88,17 @@ if [ "$INTERNAL_URL" != "null" ] && [ ! -z "$INTERNAL_URL" ]; then
     echo "URL interne: $INTERNAL_URL"
     echo "URL publique: $PUBLIC_URL"
     
+    echo ""
+    
     # Télécharger le fichier
-    curl -k -L "$PUBLIC_URL" --output downloaded_${FILENAME}
+    curl -k -s -L "$PUBLIC_URL" --output downloaded_${FILENAME}
     
     if [ -f "downloaded_${FILENAME}" ]; then
         echo "Fichier téléchargé: downloaded_${FILENAME}"
         file "downloaded_${FILENAME}"
     fi
 else
-    echo "Erreur: $RESPONSE"
+    echo "Erreur: $DOWNLOAD_RESPONSE"
 fi
 
 

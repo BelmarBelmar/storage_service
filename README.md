@@ -137,7 +137,7 @@ sudo mv mc /usr/local/bin/
 # Configurer l'alias
 mc alias set local http://192.168.122.91:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} --api S3v4
 
-# Redéfinir les quotas (optionnel)
+# définir les quotas
 mc quota set local/user-test-example-com --size 500MiB
 
 # Vérifier le quota

@@ -17,10 +17,20 @@ Ce guide est conçu pour permettre à un administrateur système de déployer et
 * jq : pour parser le JSON (optionnel)
 * MinIO Client (mc)
 
-### 3. Réseau
-* Adresse IP fixe : 192.168.122.91 (à adapter à votre environnement)
+### 3. Composants
+| Composant | Rôle |
+|---|---|
+| **FastAPI** | Moteur métier Zero-Trust : validation, streaming, orchestration |
+| **Supabase Auth (GoTrue)** | Gestion des utilisateurs, envoi OTP, émission JWT |
+| **Supabase REST (PostgREST)** | Exposition REST automatique de la table `files` |
+| **PostgreSQL** | Persistance des métadonnées fichiers (id, email, sha256, mime, taille…) |
+| **MinIO** | Stockage binaire des fichiers (compatible S3) |
+| **Nginx** | Reverse proxy TLS, routing des 5 domaines |
+| **MailHog** | Serveur SMTP de développement (capture des emails OTP) |
+| **Loki + Promtail** | Agrégation et collecte des logs |
+| **Grafana** | Visualisation des logs centralisés |
 
-### 4. Installation
+### 4. Déploiement
 1. Mise à jour du système et installation des logiciels réquis
 
 Tapez dans votre terminal ubuntu les commandes ci-après
@@ -74,12 +84,24 @@ nano .env
 
 ```bash
 mkdir -p nginx/certs
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout nginx/certs/server.key -out nginx/certs/server.crt
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout nginx/certs/zerotrust.key \
+  -out nginx/certs/zerotrust.crt \
+  -subj "/CN=zerotrust.local" \
+  -addext "subjectAltName=DNS:zerotrust.local,DNS:s3.zerotrust.local,DNS:console.zerotrust.local,DNS:monitoring.zerotrust.local,DNS:mail.zerotrust.local"
 ```
 
-5. Configuration du fichier nginx/nginx.conf
+5. Configurer les DNS locaux
 
-À ce niveau, allez juste dans le fichier et remplacez toutes les occurences de l'adresse IP 192.168.122.91 par l'adresse IP de votre VM.
+```bash
+sudo tee -a /etc/hosts << EOF
+127.0.0.1  zerotrust.local
+127.0.0.1  s3.zerotrust.local
+127.0.0.1  console.zerotrust.local
+127.0.0.1  monitoring.zerotrust.local
+127.0.0.1  mail.zerotrust.local
+EOF
+```
 
 
 6. Lancement de la stack
@@ -93,86 +115,42 @@ docker compose ps
 ```
 
 
-7. Initialisation de la base de données
+7. Initialiser la base de données
 
-COnfiguration simple:
-
-```bash
-docker exec -it storage_postgres psql -U postgres -c "CREATE ROLE anon nologin; CREATE ROLE authenticated nologin; CREATE ROLE service_role nologin;"
-```
-
-`Déboguage:` Au cas où vous aurez des problèmes avec la base de données après lancement, essayez ceci:
+La table `files` est créée automatiquement via `supabase/init.sql` au premier démarrage. Pour vérifier :
 
 ```bash
-docker exec -it storage_postgres psql -U postgres -d storage_db -c "
-CREATE SCHEMA IF NOT EXISTS auth;
-
-DO \$\$ BEGIN
-    CREATE TYPE auth.factor_type AS ENUM ('totp', 'webauthn', 'phone');
-EXCEPTION WHEN duplicate_object THEN null; END \$\$;
-
-DO \$\$ BEGIN
-    CREATE TYPE auth.factor_status AS ENUM ('unverified', 'verified');
-EXCEPTION WHEN duplicate_object THEN null; END \$\$;
-
-DO \$\$ BEGIN
-    CREATE TYPE auth.aal_level AS ENUM ('aal1', 'aal2', 'aal3');
-EXCEPTION WHEN duplicate_object THEN null; END \$\$;
-
-DO \$\$ BEGIN
-    CREATE TYPE auth.code_challenge_method AS ENUM ('s256', 'plain');
-EXCEPTION WHEN duplicate_object THEN null; END \$\$;
-"
+docker exec supabase-db psql -U postgres -c "\dt public.*"
 ```
 
 
-8. Configuration MinIO
+8. Appliquer le quota MinIO (500 Mo par utilisateur)
 
 ```bash
-# Installer MinIO Client
-wget https://dl.min.io/client/mc/release/linux-amd64/mc
-chmod +x mc
-sudo mv mc /usr/local/bin/
-
-# Configurer l'alias
-mc alias set local http://192.168.122.91:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} --api S3v4
-
-# définir les quotas
-mc quota set local/user-test-example-com --size 500MiB
-
-# Vérifier le quota
-mc quota info local/user-test-example-com
-
-# Voir l'espace utilisé
-mc du local/user-test-example-com
-
-# Lister
-mc ls local/user-test-example-com
+docker exec minio mc alias set local http://localhost:9000 \
+  ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+docker exec minio mc quota set local/user-test-example-com --size 500MiB
 ```
 
 
-9. Redémarrage
-
-```bash
-docker compose down
-docker compose up -d
-```
-
-
-10. Vérification
+9. Vérification
 
 ```bash
 # Tester l'API
 curl http://localhost:8000/health
 
-# Réponse attendue : {"status":"healthy"}
-
-
-
-# Tester la console MinIO (navigateur)
-# Ouvrir https://192.168.122.91/console/
-# Se connecter avec admin / [mot de passe défini dans .env]
+# Réponse attendue : {"status":"ok","service":"zerotrust-api"}
 ```
+
+
+### URLs d'accès (tester aussi dans le navigateur)
+
+| Service | URL |
+|---|---|
+| **API Health** | https://zerotrust.local/api/health |
+| **MinIO Console** | https://console.zerotrust.local |
+| **MailHog** | https://mail.zerotrust.local |
+| **Grafana** | https://monitoring.zerotrust.local |
 
 
 
@@ -181,109 +159,145 @@ curl http://localhost:8000/health
 1. Demander un code OTP
 
 ```bash
-curl -X POST http://localhost:8000/auth/request-otp \
+curl -k -s -X POST https://zerotrust.local/api/auth/request-otp \
   -H "Content-Type: application/json" \
-  -d '{"email": "utilisateur@exemple.com"}'
+  -d '{"email": "test@example.com"}' | jq .
 ```
 
-2. Récupération de l'OTP
+2. Récupérer l'OTP depuis MailHog
 
 ```bash
-docker compose logs api | grep OTP
-# Exemple de résultat : "OTP pour utilisateur@exemple.com: 483729 (valide 300s)"
+OTP=$(docker exec mailhog wget -qO- http://localhost:8025/api/v2/messages \
+  | jq -r '.items[0].MIME.Parts[0].Body' \
+  | tr -d '\r\n' \
+  | base64 -d \
+  | grep -oP '\b\d{6}\b' | head -1)
+echo "OTP: $OTP"
 ```
 
-3. Valider l'OTP et obtenir le token
+3. Valider l'OTP et obtenir un JWT
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
-  -H "Content-Type: application/json" \
-  -d '{"email": "utilisateur@exemple.com", "otp": "483729"}' | jq -r .access_token)
-
-echo $TOKEN
-# eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+TOKEN=$(curl -k -s -X POST \
+  "https://zerotrust.local/api/auth/verify-otp?email=test@example.com&otp_code=${OTP}" \
+  | jq -r '.access_token')
+echo "TOKEN: ${TOKEN:0:20}..."
 ```
+
 
 
 ### Gestion des fichiers
 1. Upload de fichier
 
 ```bash
-curl -X POST http://localhost:8000/files/upload \
+echo "Contenu de test" > /tmp/test.txt
+
+UPLOAD=$(curl -k -s -X POST https://zerotrust.local/api/files/upload \
   -H "Authorization: Bearer $TOKEN" \
-  -F "file=@./test-image.jpg"
-# le fichier test-image.jpg est dans le répertoire actuel. Vous pouvez le changer en mettant le chemin(@/chemin/vers/fichier)
+  -F "file=@/tmp/test.txt")
+echo $UPLOAD | jq .
+FILE_ID=$(echo $UPLOAD | jq -r '.file_id')
 ```
 
-2. Lister les fichiers
+
+2. Vérifier les métadonnées dans PostgreSQL
+
 ```bash
-curl -X GET http://localhost:8000/files/ \
+docker exec supabase-db psql -U postgres \
+  -c "SELECT id, user_email, filename, size_bytes, mime_type, uploaded_at FROM public.files;"
+```
+
+
+3. Lister ses fichiers
+
+```bash
+curl -k -s https://zerotrust.local/api/files/ \
   -H "Authorization: Bearer $TOKEN" | jq .
 ```
 
-3. Obtenir une URL de téléchargement
+
+4. Obtenir une pre-signed URL et télécharger
 
 ```bash
-curl -X GET "http://localhost:8000/files/download/image.jpg" \
-  -H "Authorization: Bearer $TOKEN" | jq .
+DL=$(curl -k -s \
+  "https://zerotrust.local/api/files/${FILE_ID}/download?filename=test.txt" \
+  -H "Authorization: Bearer $TOKEN")
+echo $DL | jq .
+
+DOWNLOAD_URL=$(echo $DL | jq -r '.download_url')
+SHA256_EXPECTED=$(echo $DL | jq -r '.sha256')
+
+curl -k -s "$DOWNLOAD_URL" -o /tmp/fichier_recu.txt
+
+SHA256_ACTUAL=$(sha256sum /tmp/fichier_recu.txt | cut -d' ' -f1)
+[ "$SHA256_EXPECTED" = "$SHA256_ACTUAL" ] \
+  && echo "INTÉGRITÉ VÉRIFIÉE" \
+  || echo "HASH DIFFÉRENT"
 ```
 
-4. Tester le téléchargement avec l'url obtenue
+
+5. Tests de sécurité
 
 ```bash
-curl -k -L "url_obtenue" --output downloaded_image.jpg
+# Upload sans token
+curl -k -s -X POST https://zerotrust.local/api/files/upload \
+  -F "file=@/tmp/test.txt" | jq .
 
+# Extension interdite
+curl -k -s -X POST https://zerotrust.local/api/files/upload \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@script.sh" | jq .
 
-# Vérifier l'intégrité
-md5sum test-image.jpg downloaded_image.jpg
-# Les deux hash doivent être identiques
+# Token invalide
+curl -k -s https://zerotrust.local/api/files/ \
+  -H "Authorization: Bearer token_invalide" | jq .
 ```
 
-5. Script de test complet
+6. Script de test complet
 
 Un script de test complet (`test_api.sh`) est disponible dans le répertoire dans le but d'automatiser les tests avec les fichiers.
-Pour l'utiliser, remplacer toutes les occurences de l'adresse IP 192.168.122.91 par l'adresse IP de votre VM.
 
 ```bash
 chmod +x test_api.sh
-./test_api.sh
+bash test_api.sh
 ```
 
 
 
-### Logs centralisés
-Analyser les logs Nginx
+---
 
+## Déboguage
+
+**supabase-auth en boucle de redémarrage**
 ```bash
-tail -f logs/nginx/access.log
+# Créer le rôle requis par GoTrue
+docker exec supabase-db psql -U postgres -c "
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE ROLE supabase_auth_admin WITH LOGIN PASSWORD 'votre_password' SUPERUSER;
+GRANT ALL ON SCHEMA auth TO supabase_auth_admin;
+"
+# S'assurer que PostgreSQL écoute sur toutes les interfaces
+docker exec supabase-db psql -U postgres -c "ALTER SYSTEM SET listen_addresses = '*';"
+docker compose restart db auth
 ```
 
-
-## Commandes Docker utiles
-Quelques commandes utiles, qui pourront aider en cas de déboguage
-
+**L'API ne se connecte pas à PostgreSQL**
 ```bash
-# Voir l'état des conteneurs
-docker compose ps
+docker exec supabase-db psql -U postgres -c "SHOW listen_addresses;"
+# Doit retourner '*'
+```
 
-# Voir les logs
-docker compose logs -f api        # API en temps réel
-docker compose logs -f nginx      # Logs Nginx
-docker compose logs -f minio      # Logs MinIO
+**MinIO - Erreur SignatureDoesNotMatch**
+```bash
+# La variable MINIO_SERVER_URL doit être absente du docker-compose.yml
+grep MINIO_SERVER_URL docker-compose.yml
+```
 
-# Redémarrer un service
-docker compose restart api
-
-# Arrêter tous les services
-docker compose down
-
-# Démarrer tous les services
+**Tout réinitialiser**
+```bash
+docker compose down -v
+sudo rm -rf data/postgres/*
 docker compose up -d
-
-# Reconstruire l'API après modification
-docker compose build api
-docker compose up -d api
-
-# Arrêter et supprimer tout
-docker compose down -v  # -v supprime aussi les volumes
 ```
+
+---

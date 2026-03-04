@@ -1,121 +1,70 @@
 #!/bin/bash
 
-# Couleurs
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
-
-echo "=== Test de l'API ==="
-
-
-# Demander un OTP
-echo -e "\n${GREEN}1. Demande d'OTP...${NC}"
-curl -s -X POST http://localhost:8000/auth/request-otp \
+# 1. OTP
+echo "=== Demande OTP ==="
+curl -sk -X POST https://zerotrust.local/api/auth/request-otp \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com"}'
+  -d '{"email": "test2@example.com"}' > /dev/null
+sleep 2
 
-
+OTP=$(docker exec mailhog wget -qO- http://localhost:8025/api/v2/messages \
+  | jq -r '.items[0].MIME.Parts[0].Body' \
+  | tr -d '\r\n' \
+  | base64 -d \
+  | grep -oP '\b\d{6}\b' | head -1)
+echo "OTP: $OTP"
 echo ""
 
-# Attendre un peu et récupérer l'OTP des logs
-echo -e "\n${GREEN}2. Récupération de l'OTP depuis les logs...${NC}"
-sleep 2
-OTP_LINE=$(docker compose logs api --tail 20 | grep "OTP pour" | tail -1)
-OTP=$(echo $OTP_LINE | grep -oE '[0-9]{6}' | tail -1)
+# 2. JWT
+echo "=== Génération du JWT ==="
+TOKEN=$(curl -sk -X POST \
+  "https://zerotrust.local/api/auth/verify-otp?email=test2@example.com&otp_code=$OTP" \
+  | jq -r '.access_token')
+echo "TOKEN: ${TOKEN:0:20}..."
+echo ""
 
-if [ -z "$OTP" ]; then
-    echo -e "${RED}Erreur: Impossible de récupérer l'OTP${NC}"
-    exit 1
-fi
-
-echo "OTP trouvé: $OTP"
-
-
-# Vérifier l'OTP et obtenir le token
-echo -e "\n${GREEN}3. Vérification OTP et obtention du token...${NC}"
-RESPONSE=$(curl -s -X POST http://localhost:8000/auth/verify-otp \
-  -H "Content-Type: application/json" \
-  -d "{\"email\": \"test@example.com\", \"otp\": \"$OTP\"}")
-
-TOKEN=$(echo $RESPONSE | jq -r .access_token)
-
-if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
-    echo -e "${RED}Erreur: Token non reçu${NC}"
-    echo "Réponse: $RESPONSE"
-    exit 1
-fi
-
-echo "Token recu: ${TOKEN:0:20}..."
-
-
-# Uploader un fichier
-echo -e "\n${GREEN}4. Upload du fichier...${NC}"
-if [ ! -f "./test-image.jpg" ]; then
-    echo "Création d'un fichier de test..." # au cas où le fichier serai absent dans le repertoire
-    echo "Ceci est un fichier de test" > ./test.txt
-    FILE="./test.txt"
-else
-    FILE="./test-image.jpg"
-fi
-
-UPLOAD_RESPONSE=$(curl -s -X POST http://localhost:8000/files/upload \
+# 3. Upload
+echo "=== Upload de fichier ==="
+UPLOAD=$(curl -sk -X POST https://zerotrust.local/api/files/upload \
   -H "Authorization: Bearer $TOKEN" \
-  -F "file=@$FILE")
+  -F "file=@./test.txt")
+echo $UPLOAD | jq .
+FILE_ID=$(echo $UPLOAD | jq -r '.file_id')
+echo ""
 
-echo "Réponse upload: $UPLOAD_RESPONSE"
-
-
-# Lister les fichiers
-echo -e "\n${GREEN}5. Liste des fichiers...${NC}"
-curl -s -X GET http://localhost:8000/files/ \
-  -H "Authorization: Bearer $TOKEN" | jq .
-
-
-# Obtenir une URL de téléchargement
-FILENAME=$(basename $FILE)
-echo -e "\n${GREEN}6. Génération URL de téléchargement pour $FILENAME...${NC}"
-DOWNLOAD_RESPONSE=$(curl -s -X GET "http://localhost:8000/files/download/$FILENAME" \
+# 4. Pre-signed URL
+echo "=== Génération du pre-signed URL ==="
+DL=$(curl -sk "https://zerotrust.local/api/files/$FILE_ID/download?filename=test.txt" \
   -H "Authorization: Bearer $TOKEN")
+echo $DL | jq .
+DOWNLOAD_URL=$(echo $DL | jq -r '.download_url')
+SHA256_EXPECTED=$(echo $DL | jq -r '.sha256')
+echo ""
 
+# 5. Téléchargement et vérification de l'intégrité
+echo "=== Téléchargement et vérification SHA-256 ==="
+curl -sk "$DOWNLOAD_URL" -o fichier_recu.txt
+SHA256_ACTUAL=$(sha256sum fichier_recu.txt | cut -d' ' -f1)
+echo "SHA256 attendu : $SHA256_EXPECTED"
+echo "SHA256 reçu    : $SHA256_ACTUAL"
+[ "$SHA256_EXPECTED" = "$SHA256_ACTUAL" ] && echo "INTÉGRITÉ VÉRIFIÉE" || echo "HASH DIFFÉRENT"
+echo ""
 
-# Extraire l'URL et la convertir
-INTERNAL_URL=$(echo $DOWNLOAD_RESPONSE | jq -r .url)
-if [ "$INTERNAL_URL" != "null" ] && [ ! -z "$INTERNAL_URL" ]; then
-    # Remplacer minio:9000 par l'IP publique
-    PUBLIC_URL=$(echo $INTERNAL_URL | sed 's/minio:9000/192.168.122.91/')
-    PUBLIC_URL=$(echo $PUBLIC_URL | sed 's/http:/https:/')
-    
-    echo "URL interne: $INTERNAL_URL"
-    echo "URL publique: $PUBLIC_URL"
-    
-    echo ""
-    
-    # Télécharger le fichier
-    curl -k -s -L "$PUBLIC_URL" --output downloaded_${FILENAME}
-    
-    if [ -f "downloaded_${FILENAME}" ]; then
-        echo "Fichier téléchargé: downloaded_${FILENAME}"
-        file "downloaded_${FILENAME}"
-    fi
-else
-    echo "Erreur: $DOWNLOAD_RESPONSE"
-fi
+# 6. Lister ses fichiers
+echo "=== Lister ses fichiers ==="
+curl -sk https://zerotrust.local/api/files/ \
+  -H "Authorization: Bearer $TOKEN" | jq .
+echo ""
 
-
-# Teste de vérification d'envoi de fichier invalide
-echo -e "\n${GREEN}Teste de vérification d'envoi de fichier INVALIDE...${NC}"
-echo -e "\n${GREEN}7. Upload du fichier INVALIDE...${NC}"
-UPLOAD_RESPONSE=$(curl -s -X POST http://localhost:8000/files/upload \
+# 7. Extension non autorisée
+echo "=== Test extension non autorisée ==="
+curl -sk -X POST https://zerotrust.local/api/files/upload \
   -H "Authorization: Bearer $TOKEN" \
-  -F "file=@./test.exe")
+  -F "file=@./test_script.sh" | jq .
+echo ""
 
-echo "$UPLOAD_RESPONSE"
-
-echo -e "\n${GREEN}8. Upload d'un fichier valide pour confirmationn...${NC}"
-UPLOAD_RESPONSE=$(curl -s -X POST http://localhost:8000/files/upload \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@./test-valid.txt")
-echo "$UPLOAD_RESPONSE"
-
-
-echo -e "\n${GREEN}Test terminé !${NC}"
+# 8. Upload sans token
+echo "=== Test sans token ==="
+curl -sk -X POST https://zerotrust.local/api/files/upload \
+  -F "file=@./test.txt" | jq .
+echo ""

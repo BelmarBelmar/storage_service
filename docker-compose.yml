@@ -1,113 +1,263 @@
 services:
 
-  postgres:
-    image: postgres:15
-    container_name: storage_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - storage_net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
-  gotrue:
-    image: supabase/gotrue:v2.158.1
-    container_name: storage_auth
-    restart: unless-stopped
-    environment:
-      GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
-      GOTRUE_JWT_SECRET: ${GOTRUE_JWT_SECRET}
-      GOTRUE_SITE_URL: http://localhost
-      GOTRUE_API_HOST: 0.0.0.0
-      GOTRUE_API_PORT: 8081
-      API_EXTERNAL_URL: https://localhost/auth
-      PORT: 8081
-      GOTRUE_API_EXTERNAL_URL: https://localhost/auth
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - storage_net
-
+  # MinIO - Stockage Objet S3
   minio:
-    image: minio/minio:latest
-    container_name: storage_minio
+    image: quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
-    ports:                                     
-      - "9000:9000"                            
-      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_ROOT_USER_FILE: ""
-      MINIO_ROOT_PASSWORD_FILE: ""
-      MINIO_BROWSER_REDIRECT_URL: https://192.168.122.91/console/
-      MINIO_SERVER_URL: https://192.168.122.91/
-      MINIO_DOMAIN: 192.168.122.91
-      MINIO_PUBLIC_IPs: 192.168.122.91
-      MINIO_ENDPOINT: 192.168.122.91
-      MINIO_AUDIT_LOG_ENABLE: "on"
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}  # Pour les vieilles versions
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER: "on"
+      MINIO_AUDIT_WEBHOOK_ENABLE: "off"
     volumes:
       - minio_data:/data
+      - ./minio/policies:/policies:ro
     networks:
-      - storage_net
+      - internal
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    expose:
+      - "9000"
+      - "9001"
 
-  nginx:
-    image: nginx:latest
-    container_name: storage_nginx
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/certs:/etc/nginx/certs:ro
-      - ./logs/nginx:/var/log/nginx
+  # MinIO Init - Création des buckets et politiques
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: minio-init
     depends_on:
-      - minio
-      - gotrue
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh /init.sh
+    volumes:
+      - ./minio/init.sh:/init.sh:ro
+      - ./minio/policies:/policies:ro
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_QUOTA_MB: ${MINIO_QUOTA_MB:-500}
     networks:
-      - storage_net
+      - internal
+    restart: "no"
 
+  # PostgreSQL - Base de données Supabase
+  db:
+    image: postgres:15-alpine
+    container_name: supabase-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./supabase/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - internal
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: postgres -c listen_addresses='*'
+
+  # Supabase Auth (GoTrue)
+  auth:
+    image: supabase/gotrue:v2.143.0
+    container_name: supabase-auth
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: "0.0.0.0"
+      GOTRUE_API_PORT: "9999"
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: "postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@db:5432/postgres"
+      GOTRUE_SITE_URL: ${SITE_URL}
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-mailhog}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-1025}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_FROM:-noreply@zerotrust.local}
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+      GOTRUE_MAILER_OTP_EXP: 300
+      API_EXTERNAL_URL: ${SITE_URL}
+      GOTRUE_API_EXTERNAL_URL: ${SITE_URL}
+    networks:
+      - internal
+    expose:
+      - "9999"
+
+  # Supabase REST API (PostgREST)
+  rest:
+    image: postgrest/postgrest:v12.0.2
+    container_name: supabase-rest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_DB_URI: "postgres://authenticator:${POSTGRES_PASSWORD}@db:5432/postgres"
+      PGRST_DB_SCHEMA: public,storage
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+    networks:
+      - internal
+    expose:
+      - "3000"
+
+  # MailHog - Serveur SMTP de test
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: mailhog
+    restart: unless-stopped
+    networks:
+      - internal
+    expose:
+      - "1025"   # SMTP
+      - "8025"   # Interface web
+
+  # API Zero-Trust
   api:
     build:
-      context: .
-      dockerfile: Dockerfile.api
-    container_name: storage_api
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: zerotrust-api
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
+      # MinIO
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-      JWT_SECRET: ${GOTRUE_JWT_SECRET}
-      MAX_FILE_SIZE_MB: 500
+      MINIO_SECURE: "false"
+      MINIO_BUCKET_PREFIX: ${MINIO_BUCKET_PREFIX:-user}
+      # Base de données
+      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@db:5432/postgres"
+      # Auth
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: HS256
+      # OTP
+      OTP_EXPIRY_SECONDS: 300
+      OTP_LENGTH: 6
+      # SMTP
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: ${SMTP_FROM:-noreply@zerotrust.local}
+      # Limites
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-100}
+      PRESIGNED_URL_EXPIRY_SECONDS: ${PRESIGNED_URL_EXPIRY_SECONDS:-900}
+      DEBUG: "true"
     volumes:
-      - ./api:/app/api  # Pour le développement avec reload
-    depends_on:
-      - minio
-      - postgres
+      - ./api:/app
     networks:
-      - storage_net
+      - internal
+      - external
+    expose:
+      - "8000"
 
+  # Nginx - Reverse Proxy avec TLS
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    restart: unless-stopped
+    depends_on:
+      - api
+      - minio
+      - auth
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - internal
+      - external
+
+  # Loki - Logs centralisée
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: loki
+    restart: unless-stopped
+    user: "0"
+    volumes:
+      - loki_data:/loki
+      - ./nginx/loki-config.yml:/etc/loki/local-config.yaml:ro
+    networks:
+      - internal
+    expose:
+      - "3100"
+
+  # Promtail - Agent de collecte de logs
+  promtail:
+    image: grafana/promtail:2.9.0
+    container_name: promtail
+    restart: unless-stopped
+    depends_on:
+      - loki
+    volumes:
+      - nginx_logs:/var/log/nginx:ro
+      - ./nginx/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal
+
+  # Grafana - Visualisation des logs
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    restart: unless-stopped
+    depends_on:
+      - loki
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - internal
+    expose:
+      - "3000"
+
+# Volumes persistants
 volumes:
-  postgres_data:
   minio_data:
+    driver: local
+  db_data:
+    driver: local
+  nginx_logs:
+    driver: local
+  loki_data:
+    driver: local
+  grafana_data:
+    driver: local
 
+# Réseaux
 networks:
-  storage_net:
+  internal:
+    driver: bridge
+    internal: true
+  external:
     driver: bridge
